@@ -35,6 +35,9 @@ jobs:
 
       - name: Ensure proxies (loops until enough)
         run: python ensure_proxies.py --min 40 --max-wait 10
+      
+      - name: Bisect hosts x signing
+        run: python tiktok_bot.py --bisect --residential-only
 
       - name: Host diagnostics
         run: python tiktok_bot.py --test-hosts

@@ -1,26 +1,16 @@
 #!/usr/bin/env python3
 """
-tiktok_bot.py
--------------
-Multimetric TikTok engagement bot for Whop Content Rewards clipping campaigns.
-
-Key hardening over v1:
-  * Multi-host API fallback (one TikTok edge can block a datacenter IP).
-  * Optional auto-bootstrap: guarantees a proxy pool before sending.
-  * --test-hosts diagnostics so a silent 456-error run tells you why.
+tiktok_bot.py  (v3)
+Signed TikTok engagement bot. Handles the empty-200 soft block, signs requests,
+rotates host + device + IP on failure.
 """
 from __future__ import annotations
 
-import argparse
-import json
-import math
-import random
-import re
-import threading
-import time
+import argparse, json, math, random, re, threading, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlencode
 
 import requests
 
@@ -31,14 +21,30 @@ from config import (
 )
 from check_proxies import load_lines, parse_proxy
 
-# --- multiple TikTok edges; a blocked host rotates out ---
-API_HOSTS = [
-    "https://api19-core-useast5.us.tiktokv.com/aweme/v1/aweme/stats/",
-    "https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/aweme/stats/",
-    "https://api22-normal-c-useast2a.tiktokv.com/aweme/v1/aweme/stats/",
-]
+# --- FIX 1: signing -------------------------------------------------------
+try:
+    from SignerPy import sign as sp_sign
+    HAVE_SIGNER = True
+except Exception:
+    HAVE_SIGNER = False
 
-DUTY = 0.65   # fraction of wall-clock actually spent sending (slice/interval)
+try:
+    from SignerPy.hosts import host as sp_hosts
+    HOSTS = [f"https://{h}" for h in sp_hosts()]
+except Exception:
+    HOSTS = [
+        "https://api16-normal-c-useast1a.tiktokv.com",
+        "https://api22-normal-c-useast2a.tiktokv.com",
+        "https://api19-core-useast5.us.tiktokv.com",
+        "https://api16-normal-c-alisg.tiktokv.com",
+        "https://api16-normal-no1a.tiktokv.eu",
+    ]
+
+STATS_PATH = "/aweme/v1/aweme/stats/"
+MIN_BODY = 4
+DUTY = 0.65
+
+_SIGN_MODE: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +70,7 @@ def load_campaigns(path: Path) -> list[Campaign]:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(raw, dict):
         raw = raw.get("campaigns", [])
-    camps = []
+    out = []
     for e in raw:
         c = Campaign(
             name=e.get("name") or e.get("url", "unnamed"),
@@ -77,8 +83,8 @@ def load_campaigns(path: Path) -> list[Campaign]:
             enabled=bool(e.get("enabled", True)),
         )
         if c.cap_views > 0:
-            camps.append(c)
-    return camps
+            out.append(c)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -96,8 +102,7 @@ def rand_iid() -> int:
 
 def build_proxy_url(cfg) -> str:
     auth = f"{cfg.username}:{cfg.password or ''}@" if cfg.username else ""
-    s = cfg.scheme
-    s = {"socks4": "socks4a", "socks5": "socks5h", "https": "http"}.get(s, s)
+    s = {"socks4": "socks4a", "socks5": "socks5h", "https": "http"}.get(cfg.scheme, cfg.scheme)
     return f"{s}://{auth}{cfg.host}:{cfg.port}"
 
 
@@ -114,11 +119,10 @@ def load_proxy_pool(residential_only: bool) -> list[dict]:
         if not cfg:
             continue
         if residential_only:
-            key = f"{cfg.scheme}://{cfg.host}:{cfg.port}"
-            if geo.get(key, {}).get("is_datacenter", True):
+            if geo.get(f"{cfg.scheme}://{cfg.host}:{cfg.port}", {}).get("is_datacenter", True):
                 continue
-        url = build_proxy_url(cfg)
-        pool.append({"http": url, "https": url})
+        u = build_proxy_url(cfg)
+        pool.append({"http": u, "https": u})
     return pool
 
 
@@ -157,24 +161,51 @@ def make_params(item_id: str, like_rate: float, share_rate: float) -> dict:
     }
 
 
-def headers_for() -> dict:
-    return {
+def _sign(params: dict, qs: str) -> dict:
+    """FIX 1: produce x-gorgon/x-ladon/x-argus/x-khronos/x-ss-stub."""
+    global _SIGN_MODE
+    if not HAVE_SIGNER:
+        return {}
+    for mode, arg in (("str", qs), ("dict", params)):
+        if _SIGN_MODE and mode != _SIGN_MODE:
+            continue
+        try:
+            sig = sp_sign(params=arg, payload=None, version=8404)
+            _SIGN_MODE = mode
+            return {k: v for k, v in sig.items() if isinstance(v, str)}
+        except Exception:
+            continue
+    return {}
+
+
+def send_once(host: str, params: dict, proxy, force_sign: bool = True):
+    """Returns (kind, detail). kind in {ok, softblock, hardblock, err}."""
+    qs = urlencode(params)                     # our insertion order = signed order
+    headers = {
         "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
         "user-agent": random.choice(DEVICE_POOL)["ua"],
         "accept-encoding": "gzip",
+        "connection": "close",                 # FIX 3: fresh TCP -> new proxy IP
     }
+    if force_sign:
+        headers.update(_sign(params, qs))
 
+    r = requests.post(f"{host}{STATS_PATH}?{qs}", headers=headers,
+                      proxies=proxy, timeout=REQUEST_TIMEOUT)
 
-def test_hosts() -> None:
-    print("[*] host connectivity test:")
-    for h in API_HOSTS:
-        try:
-            r = requests.post(h, headers=headers_for(),
-                              params=make_params("7123456789012345678", 0, 0), timeout=10)
-            ctype = r.headers.get("content-type", "")[:24]
-            print(f"    {h.split('/')[2]:<42} HTTP {r.status_code}  ct={ctype}  body={r.text[:60]!r}")
-        except Exception as e:
-            print(f"    {h.split('/')[2]:<42} FAIL {type(e).__name__}: {e}")
+    if r.status_code >= 400:
+        return "hardblock", f"HTTP {r.status_code}"
+    body = r.content
+    if len(body) < MIN_BODY:                   # FIX 2: soft block
+        return "softblock", "empty body"
+    try:
+        data = r.json()
+    except Exception:
+        return "softblock", "non-json body"
+    code = data.get("status_code")
+    if code == 0:
+        return "ok", None
+    return "softblock", f"status_code={code}"
 
 
 # ---------------------------------------------------------------------------
@@ -186,16 +217,16 @@ class Pacer:
         self._next = self.start
         self._lock = threading.Lock()
 
-    def _envelope(self, elapsed):
+    def _env(self, e):
         if self.shape != "bell" or not self.duration:
             return 1.0
-        x = min(max(elapsed / self.duration, 0.0), 1.0)
+        x = min(max(e / self.duration, 0.0), 1.0)
         return max(0.12, 0.5 - 0.5 * math.cos(2 * math.pi * x))
 
     def acquire(self):
         with self._lock:
             now = time.time()
-            interval = (1.0 / self.base_rps) / self._envelope(now - self.start)
+            interval = (1.0 / self.base_rps) / self._env(now - self.start)
             self._next = max(self._next, now) + interval * random.uniform(1 - self.jitter, 1 + self.jitter)
             wait = max(0.0, self._next - now)
         if wait:
@@ -220,41 +251,36 @@ def save_state(state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-def worker(camp, shared, lock, pacer, pool, use_proxy, debug):
-    host = random.choice(API_HOSTS)
+def worker(camp, shared, lock, pacer, pool, use_proxy, debug, hosts):
     while not shared["stop"]:
         pacer.acquire()
         if shared["stop"]:
             break
-        proxy = random.choice(pool) if (use_proxy and pool) else None
         params = make_params(camp.item_id, camp.like_rate, camp.share_rate)
+        proxy = random.choice(pool) if (use_proxy and pool) else None
+        host = random.choice(hosts)
         try:
-            r = requests.post(host, headers=headers_for(), params=params,
-                              proxies=proxy, timeout=REQUEST_TIMEOUT)
-            code = r.json().get("status_code")
-            with lock:
-                if code == 0:
-                    shared["views"] += 1
-                    if params["digg_delta"]:
-                        shared["likes"] += 1
-                    if params["share_delta"]:
-                        shared["shares"] += 1
-                else:
-                    shared["bad"] += 1
+            kind, detail = send_once(host, params, proxy)
         except Exception as e:
-            with lock:
-                shared["err"] += 1
-                if debug and shared["err"] <= 5:
-                    print(f"    [dbg] {host.split('/')[2]} {type(e).__name__}: {e}")
-            host = random.choice(API_HOSTS)   # rotate edge on failure
-        finally:
-            with lock:
-                shared["sent"] += 1
+            kind, detail = "err", type(e).__name__
+
+        with lock:
+            if kind == "ok":
+                shared["views"] += 1
+                if params["digg_delta"]:
+                    shared["likes"] += 1
+                if params["share_delta"]:
+                    shared["shares"] += 1
+            else:
+                shared[kind] = shared.get(kind, 0) + 1
+                if debug and shared["_dbg"] < 6:
+                    shared["_dbg"] += 1
+                    print(f"    [dbg] {kind}: {detail} @ {host.split('//')[1][:26]}")
+            shared["sent"] += 1
 
 
-# ---------------------------------------------------------------------------
 def run_campaign(camp, state, pool, use_proxy, runtime_s, shape, rps_override,
-                 workers_override, duty, dry, debug):
+                 workers_override, duty, dry, debug, hosts):
     item_id = camp.item_id
     target = camp.target
     st = state["videos"].setdefault(item_id, {"ok": 0, "likes": 0, "shares": 0,
@@ -269,10 +295,9 @@ def run_campaign(camp, state, pool, use_proxy, runtime_s, shape, rps_override,
 
     print(f"\n=== {camp.name} ===")
     print(f"    item_id  : {item_id}")
-    print(f"    cap      : {camp.cap_views:,}  x{camp.overshoot:.2f} -> target {target:,}")
-    print(f"    progress : {st['ok']:,}/{target:,}  (remaining {remaining:,})")
-    print(f"    pacing   : {rps:.3f} req/s  window~{window_left/3600:.2f}h  shape={shape}")
-    print(f"    ratios   : like {camp.like_rate:.0%}  share {camp.share_rate:.0%}")
+    print(f"    cap      : {camp.cap_views:,} x{camp.overshoot:.2f} -> target {target:,}")
+    print(f"    progress : {st['ok']:,}/{target:,} (remaining {remaining:,})")
+    print(f"    pacing   : {rps:.3f} req/s  shape={shape}  signer={'on' if HAVE_SIGNER else 'OFF'}")
 
     if remaining <= 0:
         print("    -> complete")
@@ -281,19 +306,20 @@ def run_campaign(camp, state, pool, use_proxy, runtime_s, shape, rps_override,
         print(f"    -> dry: {remaining:,} hits (~{remaining/rps/60:.1f} min)")
         return
 
-    shared = {"views": 0, "likes": 0, "shares": 0, "bad": 0, "err": 0, "sent": 0, "stop": False}
+    shared = {"views": 0, "likes": 0, "shares": 0, "softblock": 0,
+              "hardblock": 0, "err": 0, "sent": 0, "stop": False, "_dbg": 0}
     lock = threading.Lock()
     pacer = Pacer(rps, shape=shape, duration=runtime_s)
     workers_n = workers_override or max(6, min(int(rps * REQUEST_TIMEOUT) + 6, 96))
     stop_at = (time.time() + runtime_s) if runtime_s else None
 
     threads = [threading.Thread(target=worker, args=(camp, shared, lock, pacer, pool,
-                                                      use_proxy, debug), daemon=True)
+                                                     use_proxy, debug, hosts), daemon=True)
                for _ in range(workers_n)]
     for t in threads:
         t.start()
 
-    last_save = time.time()
+    last = time.time()
     try:
         while True:
             time.sleep(0.5)
@@ -303,12 +329,12 @@ def run_campaign(camp, state, pool, use_proxy, runtime_s, shape, rps_override,
                 break
             if stop_at and time.time() >= stop_at:
                 break
-            if time.time() - last_save > 10:
+            if time.time() - last > 10:
                 with lock:
                     st["ok"] += shared["views"] - st.get("_flushed", 0)
                 st["_flushed"] = shared["views"]
                 save_state(state)
-                last_save = time.time()
+                last = time.time()
     except KeyboardInterrupt:
         print("\n[*] Ctrl-C - stopping...")
     finally:
@@ -321,48 +347,53 @@ def run_campaign(camp, state, pool, use_proxy, runtime_s, shape, rps_override,
             st["shares"] += shared["shares"]
         st.pop("_flushed", None)
         save_state(state)
-        print(f"    [+] run: +{shared['views']:,} views +{shared['likes']:,} likes "
-              f"+{shared['shares']:,} shares (bad {shared['bad']} err {shared['err']})")
+        print(f"    [+] run: +{shared['views']:,} views (soft {shared['softblock']} "
+              f"hard {shared['hardblock']} err {shared['err']})")
         print(f"    [+] total: {st['ok']:,}/{target:,}")
 
 
 # ---------------------------------------------------------------------------
+def bisect(item_id: str, pool: Optional[list[dict]]) -> int:
+    """FIX: tests direct AND through-proxy, signed AND raw."""
+    if not HAVE_SIGNER:
+        print("[!] SignerPy missing -> signing disabled. pip install SignerPy")
+
+    targets = [("direct", None)]
+    if pool:
+        for _ in range(min(3, len(pool))):
+            targets.append(("proxy", random.choice(pool)))
+
+    print("[*] bisect: path x host x signing")
+    for label, proxy in targets:
+        for host in HOSTS[:4]:
+            for use_sign in (True, False):
+                p = make_params(item_id, 0, 0)
+                try:
+                    kind, detail = send_once(host, p, proxy, force_sign=use_sign)
+                except Exception as e:
+                    kind, detail = "err", type(e).__name__
+                tag = "sign" if use_sign else "raw "
+                print(f"    {label:6} {tag}  {host.split('//')[1][:34]:<36} -> {kind} {detail or ''}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--campaign")
-    ap.add_argument("--runtime", type=float, default=0, help="minutes per slice (0=to target)")
+    ap.add_argument("--runtime", type=float, default=0)
     ap.add_argument("--window", type=float, default=0)
     ap.add_argument("--rps", type=float, default=0)
     ap.add_argument("--workers", type=int, default=0)
     ap.add_argument("--shape", choices=["flat", "bell"], default="flat")
-    ap.add_argument("--duty", type=float, default=DUTY, help="slice/interval duty cycle")
+    ap.add_argument("--duty", type=float, default=DUTY)
     ap.add_argument("--no-proxy", action="store_true")
     ap.add_argument("--residential-only", action="store_true")
-    ap.add_argument("--ensure-proxies", action="store_true", default=False,
-                    help="bootstrap a proxy pool before running")
-    ap.add_argument("--test-hosts", action="store_true")
+    ap.add_argument("--ensure-proxies", action="store_true")
+    ap.add_argument("--bisect", action="store_true")
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--reset", action="store_true")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
-
-    if args.test_hosts:
-        test_hosts()
-        return 0
-
-    if not CAMPAIGNS_FILE.exists():
-        print(f"[-] Missing {CAMPAIGNS_FILE.name}")
-        return 1
-    if args.reset and STATE_FILE.exists():
-        STATE_FILE.unlink()
-
-    # bootstrap proxies if requested
-    if args.ensure_proxies and not args.no_proxy:
-        try:
-            import ensure_proxies
-            ensure_proxies.main()
-        except SystemExit:
-            pass
 
     camps = [c for c in load_campaigns(CAMPAIGNS_FILE) if c.enabled]
     if args.campaign:
@@ -374,28 +405,40 @@ def main() -> int:
     if not camps:
         print("[-] No resolvable campaigns")
         return 1
+
+    if args.bisect:
+        return bisect(camps[0].item_id)
+
+    if args.reset and STATE_FILE.exists():
+        STATE_FILE.unlink()
+    if args.ensure_proxies and not args.no_proxy:
+        try:
+            import ensure_proxies
+            ensure_proxies.main()
+        except SystemExit:
+            pass
     if args.window:
         for c in camps:
             c.window_hours = args.window
 
-    pool = None
-    use_proxy = not args.no_proxy
+    pool, use_proxy = None, not args.no_proxy
     if use_proxy:
         pool = load_proxy_pool(args.residential_only)
         if pool:
             print(f"[*] Loaded {len(pool)} proxies")
         else:
-            print("[!] No proxies -> direct mode")
             use_proxy = False
+
+    if args.bisect:
+        return bisect(camps[0].item_id, pool)
 
     state = load_state()
     runtime_s = args.runtime * 60 if args.runtime else None
-
     for camp in camps:
         run_campaign(camp, state, pool, use_proxy, runtime_s, args.shape,
-                     args.rps or None, args.workers or None, args.duty, args.dry, args.debug)
-
-    print("\n[+] Done. State saved.")
+                     args.rps or None, args.workers or None, args.duty, args.dry,
+                     args.debug, HOSTS)
+    print("\n[+] Done.")
     return 0
 
 
