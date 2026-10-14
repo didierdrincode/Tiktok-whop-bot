@@ -1,0 +1,53 @@
+name: tiktok-drip
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"     # a slice every 30 minutes (UTC)
+  workflow_dispatch:
+    inputs:
+      runtime:
+        description: "slice length in minutes"
+        default: "20"
+
+concurrency:
+  group: tiktok-drip
+  cancel-in-progress: false
+
+jobs:
+  drip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore state + proxies
+        uses: actions/cache@v4
+        with:
+          path: |
+            state.json
+            free-proxy-list.txt
+            working-proxies.txt
+            proxy-geo.json
+          key: botdata-${{ github.run_id }}
+          restore-keys: botdata-
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Harvest proxies (90s)
+        run: timeout 90 python harvester.py || true
+
+      - name: Validate + classify proxies
+        run: |
+          python check_proxies.py -i free-proxy-list.txt -o working-proxies.txt -t 8 -w 64 || true
+          python geo_resolve.py || true
+
+      - name: Run slice
+        run: python tiktok_bot.py --runtime ${{ github.event.inputs.runtime || 20 }} --residential-only
+
+      - name: Save state
+        run: python -c "import json,pathlib;p=pathlib.Path('state.json');print(p.read_text() if p.exists() else 'no state')"
