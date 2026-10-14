@@ -162,7 +162,6 @@ def make_params(item_id: str, like_rate: float, share_rate: float) -> dict:
 
 
 def _sign(params: dict, qs: str) -> dict:
-    """FIX 1: produce x-gorgon/x-ladon/x-argus/x-khronos/x-ss-stub."""
     global _SIGN_MODE
     if not HAVE_SIGNER:
         return {}
@@ -179,13 +178,12 @@ def _sign(params: dict, qs: str) -> dict:
 
 
 def send_once(host: str, params: dict, proxy, force_sign: bool = True):
-    """Returns (kind, detail). kind in {ok, softblock, hardblock, err}."""
-    qs = urlencode(params)                     # our insertion order = signed order
+    qs = urlencode(params)
     headers = {
         "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
         "user-agent": random.choice(DEVICE_POOL)["ua"],
         "accept-encoding": "gzip",
-        "connection": "close",                 # FIX 3: fresh TCP -> new proxy IP
+        "connection": "close",
     }
     if force_sign:
         headers.update(_sign(params, qs))
@@ -196,7 +194,7 @@ def send_once(host: str, params: dict, proxy, force_sign: bool = True):
     if r.status_code >= 400:
         return "hardblock", f"HTTP {r.status_code}"
     body = r.content
-    if len(body) < MIN_BODY:                   # FIX 2: soft block
+    if len(body) < MIN_BODY:
         return "softblock", "empty body"
     try:
         data = r.json()
@@ -354,7 +352,6 @@ def run_campaign(camp, state, pool, use_proxy, runtime_s, shape, rps_override,
 
 # ---------------------------------------------------------------------------
 def bisect(item_id: str, pool: Optional[list[dict]]) -> int:
-    """FIX: tests direct AND through-proxy, signed AND raw."""
     if not HAVE_SIGNER:
         print("[!] SignerPy missing -> signing disabled. pip install SignerPy")
 
@@ -406,9 +403,6 @@ def main() -> int:
         print("[-] No resolvable campaigns")
         return 1
 
-    if args.bisect:
-        return bisect(camps[0].item_id)
-
     if args.reset and STATE_FILE.exists():
         STATE_FILE.unlink()
     if args.ensure_proxies and not args.no_proxy:
@@ -429,6 +423,7 @@ def main() -> int:
         else:
             use_proxy = False
 
+    # Single, correctly positioned bisect check with the loaded pool parameter passed
     if args.bisect:
         return bisect(camps[0].item_id, pool)
 
