@@ -279,24 +279,29 @@ def main():
 
             print(f"[*] Testing candidates concurrently (Target: {TARGET_WORKING_COUNT} working proxies)...")
             working_batch = []
-            
+            seen = load_existing_proxies()
+
             workers = max(1, min(WORKERS, len(parsed_proxies)))
-            with ThreadPoolExecutor(max_workers=workers) as executor:
+            with open(PROXY_FILE, "a", encoding="utf-8") as fout, \
+                 ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {executor.submit(test_proxy_item, p): p for p in parsed_proxies}
                 for fut in as_completed(futures):
                     try:
                         proxy, ok = fut.result()
-                        if ok:
+                        if ok and proxy.raw not in seen:
+                            seen.add(proxy.raw)
+                            fout.write(proxy.raw + "\n")
+                            fout.flush()                       # survives timeout kill
                             print(f"[+] WORKING: {proxy.raw}")
                             working_batch.append(proxy.raw)
-                            # Early stop once target count is reached
                             if len(working_batch) >= TARGET_WORKING_COUNT:
-                                print(f"[*] Reached target of {TARGET_WORKING_COUNT} working proxies. Stopping checks early.")
                                 for f in futures:
                                     f.cancel()
                                 break
                     except Exception:
                         pass
+
+            print(f"[+] This cycle added {len(working_batch)} working proxies to {PROXY_FILE}")
 
             if working_batch:
                 with open(PROXY_FILE, "w", encoding="utf-8") as f:
