@@ -1,15 +1,3 @@
-"""
-check_proxies.py
-----------------
-Tests each proxy against a real HTTPS endpoint AND verifies the proxy actually
-hides your real IP. A proxy that returns 200 but forwards your real IP
-(transparent proxy) is rejected.
-
-Usage:
-    python check_proxies.py
-    python check_proxies.py -i raw.txt -o out.txt -t 8 -w 64
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -57,11 +45,11 @@ def load_lines(path) -> list[str]:
     return lines
 
 
-def parse_proxy(line: str) -> Optional[ProxyConfig]:
+def parse_proxy(line: str, default_scheme: str = "socks5") -> Optional[ProxyConfig]:
     raw = line.strip()
     if not raw:
         return None
-    scheme = "http"
+    scheme = default_scheme
     remainder = raw
     if "://" in remainder:
         scheme, remainder = remainder.split("://", 1)
@@ -86,7 +74,8 @@ def parse_proxy(line: str) -> Optional[ProxyConfig]:
         return None
     if not host:
         return None
-    return ProxyConfig(raw=raw, scheme=scheme, host=host, port=port,
+    full_raw = raw if "://" in raw else f"{scheme}://{raw}"
+    return ProxyConfig(raw=full_raw, scheme=scheme, host=host, port=port,
                        username=username, password=password)
 
 
@@ -150,7 +139,6 @@ def read_http_status(sock: socket.socket) -> Optional[int]:
 
 
 def read_response(sock: socket.socket) -> tuple[Optional[int], bytes]:
-    """Read a full HTTP response (headers + body). Returns (status, body)."""
     data = bytearray()
     while b"\r\n\r\n" not in data and len(data) < 65536:
         chunk = sock.recv(4096)
@@ -197,7 +185,6 @@ def tls_wrap(sock: socket.socket, host: str, timeout: float) -> socket.socket:
 
 
 def fetch_local_ip(timeout: float) -> Optional[str]:
-    """Your real public IP, fetched with a direct connection (no proxy)."""
     try:
         ctx = ssl.create_default_context()
         raw = socket.create_connection((TEST_URL_HOST, TEST_PORT), timeout=timeout)
@@ -273,31 +260,10 @@ def socks5_connect(sock: socket.socket, proxy: ProxyConfig, host: str, port: int
     recv_exact(sock, 2)
 
 
-def socks4_connect(sock: socket.socket, proxy: ProxyConfig, host: str, port: int) -> None:
-    try:
-        ip_bytes = socket.inet_aton(host)
-        domain = None
-    except OSError:
-        ip_bytes, domain = b"\x00\x00\x00\x01", host.encode("idna")
-    packet = bytearray(b"\x04\x01")
-    packet.extend(struct.pack(">H", port))
-    packet.extend(ip_bytes)
-    packet.extend((proxy.username or "").encode("utf-8"))
-    packet.append(0)
-    if domain is not None:
-        packet.extend(domain)
-        packet.append(0)
-    sock.sendall(bytes(packet))
-    if recv_exact(sock, 8)[1] != 0x5A:
-        raise OSError("SOCKS4 connect rejected")
-
-
 def check_socks_proxy(proxy: ProxyConfig, timeout: float) -> tuple[bool, Optional[str]]:
     sock = connect_socket(proxy, timeout)
     try:
-        if proxy.scheme == "socks4":
-            socks4_connect(sock, proxy, TEST_URL_HOST, TEST_PORT)
-        elif proxy.scheme == "socks5":
+        if proxy.scheme == "socks5":
             socks5_connect(sock, proxy, TEST_URL_HOST, TEST_PORT)
         else:
             raise OSError(f"Unsupported proxy scheme: {proxy.scheme}")
@@ -349,11 +315,15 @@ def run(input_file, output_file, timeout: float, workers: int) -> int:
 
     if LOCAL_IP is None:
         LOCAL_IP = fetch_local_ip(timeout)
-    print(f"Local IP: {LOCAL_IP or 'unknown'} "
-          f"(any proxy returning this IP is transparent and gets rejected)")
+    print(f"Local IP: {LOCAL_IP or 'unknown'} (any proxy returning this IP is transparent and gets rejected)")
 
     raw_lines = load_lines(input_file)
-    proxies = [p for line in raw_lines if (p := parse_proxy(line)) is not None]
+    proxies = []
+    for line in raw_lines:
+        default_scheme = "socks5" if "socks5" in line.lower() else "http"
+        p = parse_proxy(line, default_scheme=default_scheme)
+        if p:
+            proxies.append(p)
 
     if not proxies:
         print(f"No proxies found in {input_file}")

@@ -46,12 +46,12 @@ class ProxyConfig:
     username: Optional[str] = None
     password: Optional[str] = None
 
-def parse_proxy(line: str) -> Optional[ProxyConfig]:
+def parse_proxy(line: str, default_scheme: str = "http") -> Optional[ProxyConfig]:
     raw = line.strip()
     if not raw:
         return None
 
-    scheme = "http"
+    scheme = default_scheme
     remainder = raw
     if "://" in remainder:
         scheme, remainder = remainder.split("://", 1)
@@ -80,7 +80,8 @@ def parse_proxy(line: str) -> Optional[ProxyConfig]:
     if not host:
         return None
 
-    return ProxyConfig(raw=raw, scheme=scheme, host=host, port=port,
+    full_raw = raw if "://" in raw else f"{scheme}://{raw}"
+    return ProxyConfig(raw=full_raw, scheme=scheme, host=host, port=port,
                        username=username, password=password)
 
 # ---------------------------------------------------------------------------
@@ -252,9 +253,12 @@ def fetch_sources() -> list[str]:
             try:
                 resp = client.get(url)
                 if resp.status_code == 200:
+                    default_scheme = "socks5" if "socks5" in url.lower() else "http"
                     for line in resp.text.splitlines():
                         clean = line.strip()
                         if clean and ":" in clean and not clean.startswith("#"):
+                            if "://" not in clean:
+                                clean = f"{default_scheme}://{clean}"
                             new_lines.append(clean)
             except Exception as e:
                 print(f"[-] Error fetching source {url}: {e}")
@@ -274,8 +278,12 @@ def main():
         print(f"[*] Discovered {len(unique_candidates)} new unique proxy candidates to test.")
 
         if unique_candidates:
-            parsed_proxies = [parse_proxy(c) for c in unique_candidates]
-            parsed_proxies = [p for p in parsed_proxies if p is not None]
+            parsed_proxies = []
+            for c in unique_candidates:
+                default_scheme = "socks5" if "socks5" in c.lower() else "http"
+                p = parse_proxy(c, default_scheme=default_scheme)
+                if p:
+                    parsed_proxies.append(p)
 
             print(f"[*] Testing candidates concurrently (Target: {TARGET_WORKING_COUNT} working proxies)...")
             working_batch = []
@@ -291,7 +299,7 @@ def main():
                         if ok and proxy.raw not in seen:
                             seen.add(proxy.raw)
                             fout.write(proxy.raw + "\n")
-                            fout.flush()                       # survives timeout kill
+                            fout.flush()
                             print(f"[+] WORKING: {proxy.raw}")
                             working_batch.append(proxy.raw)
                             if len(working_batch) >= TARGET_WORKING_COUNT:
@@ -301,13 +309,14 @@ def main():
                     except Exception:
                         pass
 
-            print(f"[+] This cycle added {len(working_batch)} working proxies to {PROXY_FILE}")
+            print(f"[+] This cycle added {len(working_batch)} working proxies.")
 
             if working_batch:
+                all_working = existing_proxies.union(set(working_batch))
                 with open(PROXY_FILE, "w", encoding="utf-8") as f:
-                    for p in working_batch:
+                    for p in sorted(all_working):
                         f.write(p + "\n")
-                print(f"[+] Saved {len(working_batch)} working proxies to {PROXY_FILE}")
+                print(f"[+] Saved total {len(all_working)} working proxies to {PROXY_FILE}")
             else:
                 print("[-] Found 0 working fresh proxies in this cycle.")
         else:
