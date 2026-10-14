@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-tiktok_bot.py  (v3)
-Signed TikTok engagement bot. Handles the empty-200 soft block, signs requests,
-rotates host + device + IP on failure.
+tiktok_bot.py  (v3.1)
+Signed TikTok engagement bot with restored argument support and error handling.
 """
 from __future__ import annotations
 
@@ -21,7 +20,7 @@ from config import (
 )
 from check_proxies import load_lines, parse_proxy
 
-# --- FIX 1: signing -------------------------------------------------------
+# --- Signing setup --------------------------------------------------------
 try:
     from SignerPy import sign as sp_sign
     HAVE_SIGNER = True
@@ -207,6 +206,20 @@ def send_once(host: str, params: dict, proxy, force_sign: bool = True):
 
 
 # ---------------------------------------------------------------------------
+def test_hosts() -> None:
+    print("[*] host connectivity test:")
+    for h in HOSTS:
+        try:
+            r = requests.post(f"{h}{STATS_PATH}", headers={
+                "user-agent": DEVICE_POOL[0]["ua"],
+                "content-type": "application/x-www-form-urlencoded"
+            }, timeout=8)
+            print(f"    {h.split('/')[2]:<40} HTTP {r.status_code} body_len={len(r.content)}")
+        except Exception as e:
+            print(f"    {h.split('/')[2]:<40} FAIL {type(e).__name__}")
+
+
+# ---------------------------------------------------------------------------
 class Pacer:
     def __init__(self, rps, shape="flat", duration=None, jitter=0.35):
         self.base_rps = max(MIN_RPS, min(rps, MAX_RPS))
@@ -387,10 +400,15 @@ def main() -> int:
     ap.add_argument("--residential-only", action="store_true")
     ap.add_argument("--ensure-proxies", action="store_true")
     ap.add_argument("--bisect", action="store_true")
+    ap.add_argument("--test-hosts", action="store_true")  # Restored argument definition
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--reset", action="store_true")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
+
+    if args.test_hosts:
+        test_hosts()
+        return 0
 
     camps = [c for c in load_campaigns(CAMPAIGNS_FILE) if c.enabled]
     if args.campaign:
@@ -423,7 +441,6 @@ def main() -> int:
         else:
             use_proxy = False
 
-    # Single, correctly positioned bisect check with the loaded pool parameter passed
     if args.bisect:
         return bisect(camps[0].item_id, pool)
 
