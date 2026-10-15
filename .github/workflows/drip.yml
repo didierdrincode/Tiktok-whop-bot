@@ -1,6 +1,8 @@
 name: tiktok-drip
 
 on:
+  push:
+    branches: [ "main", "master" ]
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
@@ -15,7 +17,7 @@ concurrency:
 jobs:
   drip:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 360 # Allows running up to the maximum 6-hour GitHub Actions job limit
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -33,14 +35,22 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Ensure proxies (loops until enough)
-        run: python ensure_proxies.py --min 40 --max-wait 10
-      
-      - name: Bisect hosts x signing
-        run: python tiktok_bot.py --bisect --residential-only
-
-      - name: Host diagnostics
-        run: python tiktok_bot.py --test-hosts
-
-      - name: Run slice
-        run: python tiktok_bot.py --runtime ${{ github.event.inputs.runtime || 15 }} --residential-only --debug
+      - name: Ensure proxies & run continuous bot loop
+        run: |
+          # Set runtime variable from input or default
+          RUNTIME="${{ github.event.inputs.runtime || 15 }}"
+          
+          # Infinite loop within the 6-hour job window to keep harvesting and running
+          while true; do
+            echo "[*] Starting proxy assurance cycle..."
+            python ensure_proxies.py --min 50 --max-wait 10
+            
+            echo "[*] Running host diagnostics..."
+            python tiktok_bot.py --test-hosts || true
+            
+            echo "[*] Executing view generation slice for ${RUNTIME} minutes..."
+            python tiktok_bot.py --runtime "$RUNTIME" --residential-only --debug || true
+            
+            echo "[*] Slice finished. Looping back to harvest fresh proxies and continue..."
+            sleep 5
+          done
